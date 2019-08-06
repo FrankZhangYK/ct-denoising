@@ -21,12 +21,7 @@
 
 ## Main file(main.py) Parameters
 * Training detail
-> * num_iter : iterations (default = 200000)
-> * alpha : learning rate (default=1e-4)
+> * end_epoch : epoch(default = 10)
+> * lr : learning rate (default=1e-4)
 > * batch_size : batch size (default=128)
 
-## Run
-* train
-> python main.py
-* test
-> python main.py --phase=test

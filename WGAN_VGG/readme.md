@@ -35,8 +35,8 @@
 
 ## Main file(main.py) Parameters
 * Training detail
-> * num_iter : iterations (default = 200000)
-> * alpha : learning rate (default=1e-5)
+> * end_epoch : epoch
+> * lr : learning rate (default=1e-5)
 > * batch_size : batch size (default=128)
 > * d_iters : discriminator iteration (default=4)
 > * lambda_ : Gradient penalty term weight (default=10)
@@ -44,12 +44,6 @@
 > * #lambda_2 : MSE loss weight(in WGAN_VGG network) (default=0.1, not used)
 > * beta1 : Adam optimizer parameter (default=0.5)
 > * beta2 : Adam optimizer parameter (default=0.9)
-
-## Run
-* train
-> python main.py
-* test
-> python main.py --phase=test
 
 ## pretrained vgg
 > * https://github.com/machrisaa/tensorflow-vgg
