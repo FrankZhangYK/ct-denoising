@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Oct 11 11:04:24 2018
-
 @author: yeohyeongyu
 """
 
@@ -10,145 +8,137 @@ import os
 import tensorflow as tf
 import numpy as np
 import time
-from glob import glob
 import inout_util as ut
-import wgan_vgg_module as modules
-from random import shuffle
+import wgan_vgg_network as nt
+from tqdm import tqdm
 
 class wganVgg(object):
     def __init__(self, sess, args):
         self.sess = sess    
-        
-        ####patients folder name
-        self.train_patient_no = [d.split('/')[-1] for d in glob(args.dcm_path + '/*') if ('zip' not in d) & (d.split('/')[-1] not in args.test_patient_no)]     
-        self.test_patient_no = args.test_patient_no    
-
-
-        #save directory
-        self.p_info = '_'.join(self.test_patient_no)
-        self.checkpoint_dir = os.path.join(args.result, args.checkpoint_dir, self.p_info)
-        self.log_dir = os.path.join(args.result, args.log_dir,  self.p_info)
-        print('directory check!!\ncheckpoint : {}\ntensorboard_logs : {}'.format(self.checkpoint_dir, self.log_dir))
 
         #### set modules (generator, discriminator, vgg net)
-        self.g_net = modules.generator
-        self.d_net = modules.discriminator
-        self.vgg = modules.Vgg19(vgg_path = args.pretrained_vgg) 
+        self.g_net = nt.generator
+        self.d_net = nt.discriminator
+        self.vgg = nt.Vgg19(size = args.patch_size, vgg_path = args.pretrained_vgg) 
         
-        """
-        load images
-        """
-        print('data load... dicom -> numpy') 
-        self.image_loader = ut.DCMDataLoader(\
-              args.dcm_path, args.LDCT_path, args.NDCT_path, \
-             image_size = args.whole_size, patch_size = args.patch_size, \
-             depth = args.img_channel, image_max = args.trun_max, image_min = args.trun_min,\
-             is_unpair = args.is_unpair, augument = args.augument, norm = args.norm)
-                                     
-        self.test_image_loader = ut.DCMDataLoader(\
-             args.dcm_path, args.LDCT_path, args.NDCT_path,\
-             image_size = args.whole_size, patch_size = args.patch_size, \
-              depth = args.img_channel, image_max = args.trun_max, image_min = args.trun_min,\
-             is_unpair = args.is_unpair, augument = args.augument, norm = args.norm)
-        
-
-        t1 = time.time()
-        if args.phase == 'train':
-            self.image_loader(self.train_patient_no)
-            self.test_image_loader(self.test_patient_no)
-            print('data load complete !!!, {}\nN_train : {}, N_test : {}'.format(time.time() - t1, len(self.image_loader.LDCT_image_name), len(self.test_image_loader.LDCT_image_name)))
-        else:
-            self.test_image_loader(self.test_patient_no)
-            print('data load complete !!!, {}, N_test : {}'.format(time.time() - t1, len(self.test_image_loader.LDCT_image_name)))
-            
-
         """
         build model
-        """
-        self.z_i = tf.placeholder(tf.float32, [None, args.patch_size, args.patch_size, args.img_channel], name = 'whole_LDCT')
-        self.x_i = tf.placeholder(tf.float32, [None, args.patch_size, args.patch_size, args.img_channel], name = 'whole_LDCT')
-        #### image placehold  (patch image, whole image)
-        self.whole_z = tf.placeholder(tf.float32, [1, args.whole_size, args.whole_size, args.img_channel], name = 'whole_LDCT')
-        self.whole_x = tf.placeholder(tf.float32, [1, args.whole_size, args.whole_size, args.img_channel], name = 'whole_NDCT')
+        """                       
+        assert args.phase in ['train', 'test'], 'phase : train or test'
+        if args.phase=='test':
+            self.sample_image_loader = ut.DataLoader(args, sample_ck=True)
+            self.whole_z, self.whole_x = self.sample_image_loader.loader()
+            self.G_whole_zi = self.g_net(self.whole_z, reuse=False)
 
-        #### generate & discriminate
-        #generated images
-        self.G_zi = self.g_net(self.z_i, reuse = False)
-        self.G_whole_zi = self.g_net(self.whole_z)
+        elif args.phase=='train':
+            self.image_loader = ut.DataLoader(args)
+            self.sample_image_loader = ut.DataLoader(args, sample_ck=True)
 
-        #discriminate
-        self.D_xi = self.d_net(self.x_i, reuse = False)
-        self.D_G_zi= self.d_net(self.G_zi)
+            self.z_i, self.x_i = self.image_loader.loader()
+            self.whole_z, self.whole_x = self.sample_image_loader.loader()
 
-        #### loss define
-        #gradients penalty
-        self.epsilon = tf.random_uniform([], 0.0, 1.0)
-        self.x_hat = self.epsilon * self.x_i + (1 - self.epsilon) * self.G_zi
-        self.D_x_hat = self.d_net(self.x_hat)
-        self.grad_x_hat = tf.gradients(self.D_x_hat, self.x_hat)[0]
-        self.grad_x_hat_l2 = tf.sqrt(tf.reduce_sum(tf.square(self.grad_x_hat), axis=1))
-        self.gradient_penalty =  tf.square(self.grad_x_hat_l2 - 1.0)
+            #### generate & discriminate & feature extractor
+            #generated images
+            self.G_zi = self.g_net(self.z_i, reuse = False)
+            self.G_whole_zi = self.g_net(self.whole_z) #for sample check
 
-        #perceptual loss
-        self.G_zi_3c = tf.concat([self.G_zi]*3, axis=3)
-        self.xi_3c = tf.concat([self.x_i]*3, axis=3)
-        [w, h, d] = self.G_zi_3c.get_shape().as_list()[1:]
-        self.vgg_perc_loss = tf.reduce_mean(tf.sqrt(tf.reduce_sum(tf.square((self.vgg.extract_feature(self.G_zi_3c) -  self.vgg.extract_feature(self.xi_3c))))) / (w*h*d))
+            #discriminate
+            self.D_G_zi= self.d_net(self.G_zi, reuse = False)
+            self.D_xi = self.d_net(self.x_i)
 
-        #discriminator loss(WGAN LOSS)
-        d_loss = tf.reduce_mean(self.D_G_zi) - tf.reduce_mean(self.D_xi) 
-        grad_penal =  args.lambda_ *tf.reduce_mean(self.gradient_penalty )
-        self.D_loss = d_loss +grad_penal
-        #generator loss
-        self.G_loss = args.lambda_1 * self.vgg_perc_loss - tf.reduce_mean(self.D_G_zi)
+            #make 3-channel img for pretrained_vgg model input
+            self.G_zi_3c = tf.concat([self.G_zi]*3, axis=-1)
+            self.xi_3c = tf.concat([self.x_i]*3, axis=-1)
+            self.E_g_zi = self.vgg.extract_feature(self.G_zi_3c)
+            self.E_xi = self.vgg.extract_feature(self.xi_3c)
+            [w, h, d] = self.G_zi_3c.get_shape().as_list()[1:]
 
-
-        #### variable list
-        t_vars = tf.trainable_variables()
-        self.d_vars = [var for var in t_vars if 'discriminator' in var.name]
-        self.g_vars = [var for var in t_vars if 'generator' in var.name]
-
-        """
-        summary
-        """
-        #loss summary
-        self.summary_vgg_perc_loss = tf.summary.scalar("1_PerceptualLoss_VGG", self.vgg_perc_loss)
-        self.summary_d_loss_all = tf.summary.scalar("2_DiscriminatorLoss_WGAN", self.D_loss)
-        self.summary_d_loss_1 = tf.summary.scalar("3_D_loss_disc", d_loss)
-        self.summary_d_loss_2 = tf.summary.scalar("4_D_loss_gradient_penalty", grad_penal)
-        self.summary_g_loss = tf.summary.scalar("GeneratorLoss", self.G_loss)
-        self.summary_all_loss = tf.summary.merge([self.summary_vgg_perc_loss, self.summary_d_loss_all, self.summary_d_loss_1, self.summary_d_loss_2, self.summary_g_loss])
+            #### loss define
+            #discriminator loss
+            self.wgan_d_loss = -tf.reduce_mean(self.D_xi) + tf.reduce_mean(self.D_G_zi) 
+            self.epsilon = tf.random_uniform([], 0.0, 1.0)
+            self.x_hat = self.epsilon * self.x_i + (1 - self.epsilon) * self.G_zi
+            self.D_x_hat = self.d_net(self.x_hat)
+            self.grad_x_hat = tf.gradients(self.D_x_hat, self.x_hat)[0]
+            self.grad_x_hat_l2 = tf.sqrt(tf.reduce_sum(tf.square(self.grad_x_hat)))
+            self.grad_penal = args.lambda_ * tf.reduce_mean(tf.square(self.grad_x_hat_l2 - \
+                                   tf.ones_like(self.grad_x_hat_l2)))
             
-        #psnr summary
-        self.summary_psnr_ldct = tf.summary.scalar("1_psnr_LDCT", ut.tf_psnr(self.whole_z, self.whole_x, 1), family = 'PSNR')  # 0 ~ 1
-        self.summary_psnr_result = tf.summary.scalar("2_psnr_output", ut.tf_psnr(self.whole_x, self.G_whole_zi, 1), family = 'PSNR')  # 0 ~ 1
-        self.summary_psnr = tf.summary.merge([self.summary_psnr_ldct, self.summary_psnr_result])
-        
- 
-        #image summary
-        self.check_img_summary = tf.concat([tf.expand_dims(self.z_i[0], axis=0), \
-                                            tf.expand_dims(self.x_i[0], axis=0), \
-                                            tf.expand_dims(self.G_zi[0], axis=0)], axis = 2)        
-        self.summary_train_image = tf.summary.image('0_train_image', self.check_img_summary)                                    
-        self.whole_img_summary = tf.concat([self.whole_z, self.whole_x, self.G_whole_zi], axis = 2)        
-        self.summary_image = tf.summary.image('1_whole_image', self.whole_img_summary)
-        
-        #### optimizer
-        self.d_adam, self.g_adam = None, None
-        with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
-            self.d_adam = tf.train.AdamOptimizer(learning_rate= args.alpha, beta1 = args.beta1, beta2 = args.beta2).minimize(self.D_loss, var_list = self.d_vars)
-            self.g_adam = tf.train.AdamOptimizer(learning_rate= args.alpha, beta1 = args.beta1, beta2 = args.beta2).minimize(self.G_loss, var_list = self.g_vars)
+            self.D_loss = self.wgan_d_loss + self.grad_penal
+
+            #generator loss
+            self.frobenius_norm2 = tf.reduce_sum(tf.square(self.E_g_zi - self.E_xi))
+            self.vgg_perc_loss = tf.reduce_mean(self.frobenius_norm2/(w*h*d))
+            self.G_loss = args.lambda_1 * self.vgg_perc_loss - tf.reduce_mean(self.D_G_zi)
+
+
+            #### variable list
+            t_vars = tf.trainable_variables()
+            self.d_vars = [var for var in t_vars if 'discriminator' in var.name]
+            self.g_vars = [var for var in t_vars if 'generator' in var.name]
+
+            """
+            summary
+            """
+            #loss summary
+            self.summary_vgg_perc_loss = tf.summary.scalar("1_PerceptualLoss_VGG", \
+                                                           self.vgg_perc_loss)
+            self.summary_d_loss_all = tf.summary.scalar("2_DiscriminatorLoss", self.D_loss)
+            self.summary_d_loss_1 = tf.summary.scalar("3_D_loss_wgan", self.wgan_d_loss)
+            self.summary_d_loss_2 = tf.summary.scalar("4_D_loss_gradient_penalty", \
+                                                      self.grad_penal)
+            self.summary_g_loss = tf.summary.scalar("GeneratorLoss", self.G_loss)
+            self.summary_all_loss = tf.summary.merge([self.summary_vgg_perc_loss,\
+                                                      self.summary_d_loss_all,\
+                                                      self.summary_d_loss_1, \
+                                                      self.summary_d_loss_2, \
+                                                      self.summary_g_loss])
                 
+            #psnr summary
+            self.summary_psnr_ldct = tf.summary.scalar("1_psnr_LDCT", \
+                ut.tf_psnr(self.whole_z, self.whole_x, \
+                           self.sample_image_loader.psnr_range), family = 'PSNR')
+            self.summary_psnr_result = tf.summary.scalar("2_psnr_output", \
+                ut.tf_psnr(self.whole_x, self.G_whole_zi, \
+                           self.sample_image_loader.psnr_range), family = 'PSNR')
+            self.summary_psnr = tf.summary.merge([self.summary_psnr_ldct, self.summary_psnr_result])
+
+            #image summary
+            self.check_img_summary = tf.concat([tf.expand_dims(self.z_i[0], axis=0), \
+                                                tf.expand_dims(self.x_i[0], axis=0), \
+                                                tf.expand_dims(self.G_zi[0], axis=0)], \
+                                               axis = 2)        
+            self.summary_train_image = tf.summary.image('0_train_image', \
+                                                        self.check_img_summary)                                    
+            self.whole_img_summary = tf.concat([self.whole_z, \
+                                                self.whole_x, self.G_whole_zi], axis = 2)
+            self.summary_image = tf.summary.image('1_whole_image', self.whole_img_summary)
+            
+            #### optimizer
+            #self.d_adam, self.g_adam = None, None
+            with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
+                self.d_adam = tf.train.AdamOptimizer(learning_rate= args.lr, \
+                                                     beta1 = args.beta1, \
+                                                     beta2 = args.beta2).\
+                                    minimize(self.D_loss, var_list = self.d_vars)
+                self.g_adam = tf.train.AdamOptimizer(learning_rate= args.lr, \
+                                                     beta1 = args.beta1, \
+                                                     beta2 = args.beta2).\
+                                    minimize(self.G_loss, var_list = self.g_vars)
+
+            print('--------------------------------------------\n# of parameters : {} '.\
+                  format(np.sum([np.prod(v.get_shape().as_list()) \
+                                     for v in tf.trainable_variables()])))
+
+                    
         #model saver
         self.saver = tf.train.Saver(max_to_keep=None)    
-
-        print('--------------------------------------------\n# of parameters : {} '.\
-              format(np.sum([np.prod(v.get_shape().as_list()) for v in tf.trainable_variables()])))
-
-        
+            
     def train(self, args):
         self.sess.run(tf.global_variables_initializer())
-        self.writer = tf.summary.FileWriter(self.log_dir, self.sess.graph)
+
+        self.writer = tf.summary.FileWriter(self.image_loader.tfboard_save_dir, \
+                                            self.sess.graph)
 
         self.start_step = 0
         if args.continue_train:
@@ -157,114 +147,103 @@ class wganVgg(object):
             else:
                 print(" [!] Load failed...")
                 
-        print('Start point : iter : {}'.format(self.start_step))
-
+        #iteration -> epoch
+        self.start_epoch = \
+          int((self.start_step + 1) / len(self.image_loader.data_index))
+        epoch_size = len(self.image_loader.data_index)
+        
+        if args.save_freq == -1:
+            args.save_freq = epoch_size
+        print('Start point : iter : {}, epoch : {}, save freq : {}'.format(\
+            self.start_step, self.start_epoch, args.save_freq))    
         start_time = time.time()
 
-        for t in range(self.start_step, args.num_iter):
-            for _ in range(0, args.d_iters):
-                #get input images
-                real_sample_z, real_sample_x  =  self.image_loader.preproc_input(args)
+        if self.start_epoch < args.end_epoch:
+            for epoch in range(self.start_epoch, args.end_epoch):
+                for _ in range(0, epoch_size):
+                    for _ in range(0, args.d_iters):
+                        #discriminator update
+                        _ = self.sess.run(self.d_adam)
 
-                #discriminator update
-                self.sess.run(self.d_adam, \
-                      feed_dict = {self.z_i : real_sample_z,\
-                                self.x_i : real_sample_x})
-            #get input images
-            real_sample_z, real_sample_x  =  self.image_loader.preproc_input(args)
-            
-            #generator update & loss summary
-            _, summary_str= self.sess.run([self.g_adam, self.summary_all_loss], \
-                                 feed_dict = {self.z_i : real_sample_z,\
-                                        self.x_i : real_sample_x})
-            self.writer.add_summary(summary_str, t)
+                    #generator update & loss summary
+                    _, summary_str= self.sess.run([self.g_adam, self.summary_all_loss])
+                    self.writer.add_summary(summary_str, self.start_step)
 
-            #print point
-            if (t+1) % args.print_freq == 0:
-                #print loss & time 
-                d_loss, g_loss, g_zi_img, summary_str0 = self.sess.run(\
-                   [self.D_loss, self.G_loss, self.G_zi, self.summary_train_image], \
-                          feed_dict = {self.z_i : real_sample_z,\
-                                    self.x_i : real_sample_x})
-                #training sample check
-                self.writer.add_summary(summary_str0, t)
+                    #print point
+                    if (self.start_step+1) % args.print_freq == 0:
+                        currt_step = self.start_step\
+                                % len(self.image_loader.data_index)\
+                                if epoch != 0 else self.start_step
+                        #print loss & time 
+                        d_loss, g_loss = self.sess.run([self.D_loss, self.G_loss])
+                        print(("Epoch: {} {}/{} time: {} d_loss {} g_loss {}".format(\
+                            epoch, currt_step, epoch_size, time.time() - start_time, \
+                            d_loss, g_loss)))
+                        
+                    if (self.start_step+1) % args.print_sample_freq == 0:
+                        #training sample check
+                        summary_str0 = self.sess.run(self.summary_train_image)
+                        self.writer.add_summary(summary_str0, self.start_step)
+                        
+                        self.check_sample(self.start_step)
 
-                print('Iter {} Time {} d_loss {} g_loss {}'.format(t, time.time() - start_time, d_loss, g_loss))
-                self.check_sample(args, t)
+                    if (self.start_step+1) % args.save_freq == 0:
+                        self.save(self.start_step)
+                    self.start_step += 1
+            self.save(self.start_step)
+        else:
+            print('train complete!, trained model start epoch : {}, \
+                   end_epoch :  {}'.format(self.start_epoch, self.end_epoch))
 
-            if (t+1) % args.save_freq == 0:
-                self.save(args, t)
-        self.save(args, t)
-        
+
     #summary test sample image during training
-    def check_sample(self, args, t):
-        #summary whole image'
-        sltd_idx = np.random.choice(range(len(self.test_image_loader.LDCT_images)))
-        test_zi, test_xi = self.test_image_loader.LDCT_images[sltd_idx], self.test_image_loader.NDCT_images[sltd_idx]
-
-        whole_G_zi = self.sess.run(self.G_whole_zi, feed_dict={self.whole_z: test_zi.reshape(self.whole_z.get_shape().as_list())})
-        
-        summary_str1, summary_str2= self.sess.run([self.summary_image, self.summary_psnr], \
-                                 feed_dict={self.whole_z : test_zi.reshape(self.whole_z.get_shape().as_list()), \
-                                            self.whole_x : test_xi.reshape(self.whole_x.get_shape().as_list()), \
-                                            self.G_whole_zi : whole_G_zi.reshape(self.G_whole_zi.get_shape().as_list()),
-                                            })
+    def check_sample(self, t):
+        summary_str1, summary_str2 = self.sess.run(\
+            [self.summary_image, self.summary_psnr])
         self.writer.add_summary(summary_str1, t)
         self.writer.add_summary(summary_str2, t)
 
-      
-    def save(self, args, step):
-        model_name = args.model + ".model"
-        if not os.path.exists(self.checkpoint_dir):
-            os.makedirs(self.checkpoint_dir)
+    def save(self, step):
+        model_name = "WGAN_VGG.model"
 
         self.saver.save(self.sess,
-                        os.path.join(self.checkpoint_dir, model_name),
+                        os.path.join(self.image_loader.model_save_dir, model_name),
                         global_step=step)
-
 
     def load(self):
         print(" [*] Reading checkpoint...")
-        ckpt = tf.train.get_checkpoint_state(self.checkpoint_dir)
+        ckpt = tf.train.get_checkpoint_state(self.sample_image_loader.model_save_dir)
         if ckpt and ckpt.model_checkpoint_path:
             ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
             self.start_step = int(ckpt_name.split('-')[-1])
-            self.saver.restore(self.sess, os.path.join(self.checkpoint_dir, ckpt_name))
+            self.saver.restore(self.sess, os.path.join(\
+                                   self.sample_image_loader.model_save_dir, ckpt_name))
             print(self.start_step)
             return True
         else:
             return False
 
-
-    def test(self, args):
+    def inference(self, args):
         self.sess.run(tf.global_variables_initializer())
 
-        if self.load():
-            print(" [*] Load SUCCESS")
-        else:
-            print(" [!] Load failed...")
-
-        ## mk save dir (image & numpy file)    
-        npy_save_dir = os.path.join(args.result, args.test_npy_save_dir, self.p_info)
-
-        if not os.path.exists(npy_save_dir):
-            os.makedirs(npy_save_dir)
-
+        assert self.load(), 'erorr: trained model is not exsist'
 
         ## test
-        start_time = time.time()
-        for idx in range(len(self.test_image_loader.LDCT_images)):
-            test_zi, test_xi \
-            = self.test_image_loader.LDCT_images[idx], self.test_image_loader.NDCT_images[idx]
+        for idx in tqdm(self.sample_image_loader.data_index):
+            test_X, test_Y, output_img = self.sess.run(\
+                                       [self.whole_z, self.whole_x, self.G_whole_zi])
             
-            whole_G_zi = self.sess.run(self.G_whole_zi, \
-              feed_dict={self.whole_z: test_zi.reshape(self.whole_z.get_shape().as_list())})
+            save_file_nm_g = 'Gen_from_' + \
+                self.sample_image_loader.input_path_list[idx].split('/')[-1][:-4]
+            np.save(os.path.join(self.sample_image_loader.inf_save_dir, \
+                                     save_file_nm_g), output_img)
             
-            save_file_nm_f = 'from_' +  self.test_image_loader.LDCT_image_name[idx]
-            save_file_nm_t = 'to_' +  self.test_image_loader.NDCT_image_name[idx]
-            save_file_nm_g = 'Gen_from_' +  self.test_image_loader.LDCT_image_name[idx]
-            
-            np.save(os.path.join(npy_save_dir, save_file_nm_f), test_zi)
-            np.save(os.path.join(npy_save_dir, save_file_nm_t), test_xi)
-            np.save(os.path.join(npy_save_dir, save_file_nm_g), whole_G_zi)
-            
+            if args.raw_output:
+                save_file_nm_f = 'from_' + \
+                    self.sample_image_loader.input_path_list[idx].split('/')[-1][:-4]
+                save_file_nm_t = 'to_' + \
+                    self.sample_image_loader.target_path_list[idx].split('/')[-1][:-4]
+                np.save(os.path.join(self.sample_image_loader.inf_save_dir, \
+                                     save_file_nm_f), test_X)
+                np.save(os.path.join(self.sample_image_loader.inf_save_dir, \
+                                     save_file_nm_t), test_Y)

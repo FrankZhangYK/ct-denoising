@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Oct 11 11:04:24 2018
-
 @author: yeohyeongyu
 """
 
@@ -15,123 +13,162 @@ from matplotlib import pyplot as plt
 from scipy.ndimage.interpolation import rotate
 import dicom
 
-class DCMDataLoader(object):
-    def __init__(self, dcm_path, LDCT_image_path, NDCT_image_path, \
-                 image_size = 512, patch_size = 64,  depth = 1, \
-                 image_max = 3072, image_min = -1024, batch_size = 1, \
-                 is_unpair = False, augument=False, norm = 'n01', num_threads = 1, extension = 'IMA'):
+class DataLoader(object):
+    def __init__(self, args, sample_ck=False):
+        self.phase = args.phase
+        self.extension = args.extension
+        #data directory
+        input_path_list = np.array(sorted(glob(os.path.join(\
+                args.dcm_path, '*', args.input_path, '*.' + args.extension), recursive=True)))
+        target_path_list = np.array(sorted(glob(os.path.join(\
+                args.dcm_path, '*', args.target_path, '*.' + args.extension), recursive=True)))
         
-        #dicom file dir
-        self.extension = extension
-        self.dcm_path = dcm_path
-        self.LDCT_image_path = LDCT_image_path
-        self.NDCT_image_path = NDCT_image_path
+        np.random.seed(args.seed)
+        shffle_inx = list(range(len(input_path_list)))
+        np.random.shuffle(shffle_inx)
+        n_train = int(len(shffle_inx)*args.train_ratio)
+        
+        train_idx, test_idx = shffle_inx[:n_train], shffle_inx[n_train:]
+        if args.phase == 'train':
+            self.input_path_list = list(input_path_list[train_idx])
+            self.target_path_list = list(target_path_list[train_idx])
+        elif args.phase == 'test':
+            self.input_path_list = list(input_path_list[test_idx])
+            self.target_path_list = list(target_path_list[test_idx])
+
+        self.data_index = list(range(len(self.input_path_list)))
+        assert len(self.input_path_list) == len(self.target_path_list), \
+                'the number of samples of input data & target data should be same'
+        
+        #save directory        
+        self.model_save_dir = os.path.join(args.result, args.checkpoint_dir)
+        self.tfboard_save_dir = os.path.join(args.result, args.log_dir)
+        self.inf_save_dir = os.path.join(args.result, args.inference_result)
+        
+        if not os.path.exists(self.model_save_dir):
+            os.makedirs(self.model_save_dir)
+        if not os.path.exists(self.tfboard_save_dir):
+            os.makedirs(self.tfboard_save_dir)
+        if not os.path.exists(self.inf_save_dir):
+            os.makedirs(self.inf_save_dir)
+
+        print('save directories\n  model checkpoint : {}\n  inference result : {}\n  tensor board : {}'.\
+      format(self.model_save_dir, self.inf_save_dir, self.tfboard_save_dir))
         
         #image params
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.depth = depth
-
-        self.image_max = image_max
-        self.image_min = image_min
+        self.depth = args.depth
+        self.image_size = args.patch_size
+        self.whole_size = args.whole_size
+        self.trun_max = args.trun_max
+        self.trun_min = args.trun_min
+        self.patch_per_img = args.patch_per_img
         
-        #training params
-        self.batch_size = batch_size
-        self.is_unpair = is_unpair
-        self.augument = augument
-        self.norm = norm
+        #loader params
+        self.prefetch_buffer = args.prefetch_buffer
+        self.num_parallel_calls = args.num_parallel_calls
+        self.batch_size = args.batch_size
+        self.norm = args.norm
+        self.augument = args.augument
+        self.is_unpair = args.is_unpair 
+        self.count_get_images_fun = 0
+        self.sample_ck= sample_ck
+        if str(args.norm).lower() == 'n-11':
+            self.psnr_range = 2 
+        elif str(args.norm).lower() == 'n01':
+            self.psnr_range = 1
+        else:self.psnr_range =args.truc_max - args.truc_min
         
-        #CT slice name
-        self.LDCT_image_name, self.NDCT_image_name = [], []
-
-        #batch generator  prameters 
-        self.num_threads = num_threads
-        self.capacity  =  20 * self.num_threads * self.batch_size
-        self.min_queue = 10 * self.num_threads * self.batch_size
-        
+        if (sample_ck) or (args.phase=='test'):
+            self.input_path_list = list(input_path_list[test_idx])
+            self.target_path_list = list(target_path_list[test_idx])
+            self.data_index = list(range(len(self.input_path_list)))
             
-    #dicom file -> numpy array
-    def __call__(self, patent_no_list):
-        p_LDCT = []
-        p_NDCT = []
-        for patent_no in patent_no_list:
-            P_LDCT_path, p_NDCT_path =\
-            glob(os.path.join(self.dcm_path, patent_no, self.LDCT_image_path, '*.' + self.extension)), \
-            glob(os.path.join(self.dcm_path, patent_no, self.NDCT_image_path, '*.' + self.extension))
-            
-            #load images
-            org_LDCT_images, LDCT_slice_nm  = self.get_pixels_hu(self.load_scan(P_LDCT_path), '{}_{}'.format(patent_no, self.LDCT_image_path))
-            org_NDCT_images, NDCT_slice_nm  = self.get_pixels_hu(self.load_scan(p_NDCT_path), '{}_{}'.format(patent_no, self.NDCT_image_path))
-     
-            #CT slice name
-            self.LDCT_image_name.extend(LDCT_slice_nm)
-            self.NDCT_image_name.extend(NDCT_slice_nm)
-
-            #truncate & normalization  
-            p_LDCT.append(self.normalize(org_LDCT_images, self.image_max , self.image_min))
-            p_NDCT.append(self.normalize(org_NDCT_images, self.image_max , self.image_min))
-            
-        self.LDCT_images = np.concatenate(tuple(p_LDCT), axis=0)
-        self.NDCT_images = np.concatenate(tuple(p_NDCT), axis=0)
+            self.batch_size = 1
+            self.image_size = args.whole_size
+            self.augument = False
+            self.is_unpair = False
+            self.prefetch_buffer = 4
+            self.num_parallel_calls = 4
         
-        #image index
-        self.LDCT_index, self.NDCT_index = list(range(len(self.LDCT_images))), list(range(len(self.NDCT_images)))
+    def loader(self):
+        dataset = tf.data.Dataset.from_generator(self.data_generaotr, (tf.string, tf.string))
+        dataset = dataset.map(lambda input_, target_: tuple(tf.py_func(
+                    self.get_images, [input_, target_], [tf.float32, tf.float32])),\
+                    num_parallel_calls=self.num_parallel_calls)
+        dataset = dataset.prefetch(self.prefetch_buffer).repeat()
+        dataset = dataset.map(self.set_images_shape)
+        dataset = dataset.batch(self.batch_size)
+        iter_ = dataset.make_one_shot_iterator()
+        element = iter_.get_next()
+        return element
+
+    def data_generaotr(self):
+        if self.phase == 'train':
+            while True:
+                input_idx = np.random.choice(self.data_index)
+                target_idx = np.random.choice(self.data_index) \
+                                if self.is_unpair else input_idx
+                yield (self.input_path_list[input_idx], self.target_path_list[target_idx])
+        else:
+            for i in self.data_index:
+                yield (self.input_path_list[i], self.target_path_list[i])
         
-    def load_scan(self, path):
-        slices = [dicom.read_file(s) for s in path]
-        slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
-        try:
-            slice_thickness =\
-            np.abs(slices[0].ImagePositionPatient[2] - slices[1].ImagePositionPatient[2])
-        except:
-            slice_thickness = np.abs(slices[0].SliceLocation - slices[1].SliceLocation)
-        for s in slices:
-            s.SliceThickness = slice_thickness
-        return slices
-
-    def get_pixels_hu(self, slices, pre_fix_nm = ''):
-        image = np.stack([s.pixel_array for s in slices])
-        image = image.astype(np.int16)
-        image[image == -2000] = 0
-
-        digit = 4
-        slice_nm = []
-        for slice_number in range(len(slices)):
-            intercept = slices[slice_number].RescaleIntercept
-            slope = slices[slice_number].RescaleSlope
+    def get_images(self, input_dir, target_dir):
+        def get_pixels_hu(slice_):
+            image = slice_.pixel_array
+            image = image.astype(np.int16)
+            image[image == -2000] = 0
+            intercept = slice_.RescaleIntercept
+            slope = slice_.RescaleSlope
             if slope != 1:
-                image[slice_number] = slope * image[slice_number].astype(np.float32)
-                image[slice_number] = image[slice_number].astype(np.int16)
-            image[slice_number] += np.int16(intercept)
+                image = slope * image.astype(np.float32)
+                image = image.astype(np.int16)
+            image += np.int16(intercept)
+            
+            return np.array(image, dtype=np.int16)
+        
+        in_, tar_ = input_dir.decode(), target_dir.decode()
+        if ((self.count_get_images_fun % self.patch_per_img == 0) and (self.phase=='train')) or (self.phase == 'test') or (self.sample_ck):
+            self.count_get_images_fun = 0
+            if self.extension in ['IMA', 'DCM']:
+                self.input_org = get_pixels_hu(dicom.read_file(in_))
+                self.target_org = get_pixels_hu(dicom.read_file(tar_))
+            elif self.extension == 'npy':
+                self.input_org = np.load(in_)
+                self.target_org =  np.load(tar_)
 
-            # sorted(idx), sorted(d_idx)  -> [1, 10, 2], [ 0001, 0002, 0010]
-            s_idx = str(slice_number)
-            d_idx = '0'*(digit - len(s_idx)) + s_idx
-            slice_nm.append(pre_fix_nm + '_' + d_idx)
-        return np.array(image, dtype=np.int16), slice_nm
-
-    def normalize(self, img, max_ = 3072, min_=-1024):
+        input_ = self.normalize(self.input_org, self.trun_max , self.trun_min)
+        target_  = self.normalize(self.target_org, self.trun_max , self.trun_min)
+        
+        if self.image_size != self.whole_size:
+            input_, target_ = self.get_randam_patches(input_, target_)
+        return np.expand_dims(input_, axis=-1), np.expand_dims(target_, axis=-1)
+    
+    def set_images_shape(self, input_, target_ ):
+        input_.set_shape([None, None, self.depth])
+        target_.set_shape([None, None, self.depth])
+    
+        # resize to model input size
+        input_resized = tf.image.resize_images(input_, [self.image_size, self.image_size])
+        target_resized  = tf.image.resize_images(target_, [self.image_size, self.image_size])
+        return input_resized, target_resized  
+    
+    
+    def normalize(self, img, max_=3072, min_=-1024):
         img = img.astype(np.float32) 
         img[img > max_] = max_
         img[img < min_] = min_
-        if self.norm.lower()  == 'n-11':  #-1 ~ 1
+        if str(self.norm).lower()  == 'n-11':  #-1 ~ 1
             img = 2 * ((img - min_) / (max_  -  min_)) -1
             return img
-        else: # 0 ~ 1
+        elif str(self.norm).lower()  == 'n01':  #0 ~ 1
             img = (img - min_) / (max_  -  min_)
             return img
+        else:
+            return img
 
-    #RED CNN
-    def augumentation(self, LDCT, NDCT):
-            """
-            sltd_random_indx[0] : 
-                1: rotation
-                2. flipping
-                3. scaling
-                4. pass
-            sltd_random_indx[1] : 
-                select params
-            """
+    def get_randam_patches(self, LDCT_slice, NDCT_slice):
+        def augumentation(LDCT, NDCT):  #REDCNN
             sltd_random_indx=  [np.random.choice(range(4)), np.random.choice(range(2))]
             if sltd_random_indx[0] ==0 : 
                 return rotate(LDCT, 45, reshape = False), rotate(NDCT, 45, reshape = False)
@@ -146,10 +183,9 @@ class DCMDataLoader(object):
             elif sltd_random_indx[0] ==3 :
                 return LDCT, NDCT
             
-    #WGAN_VGG, RED_CNN
-    def get_randam_patches(self, LDCT_slice, NDCT_slice, patch_size, whole_size= 512):
-        whole_h =  whole_w = whole_size
-        h = w = patch_size
+            
+        whole_h =  whole_w = self.whole_size
+        h = w = self.image_size
 
         #patch image range
         hd, hu = h//2, int(whole_h - np.round(h/2))
@@ -158,42 +194,20 @@ class DCMDataLoader(object):
         #patch image center(coordinate on whole image)
         h_pc, w_pc  = np.random.choice(range(hd, hu+1)), np.random.choice(range(wd, wu+1))
         if len(LDCT_slice.shape) == 3: # 3d patch
-            LDCT_patch = LDCT_slice[:, h_pc - hd: int(h_pc + np.round(h / 2)), w_pc - wd: int(w_pc + np.round(h / 2))]
-            NDCT_patch = NDCT_slice[:, h_pc - hd: int(h_pc + np.round(h / 2)), w_pc - wd: int(w_pc + np.round(h / 2))]
+            LDCT_patch = LDCT_slice[:, h_pc - hd: int(h_pc + np.round(h / 2)),\
+                                    w_pc - wd: int(w_pc + np.round(h / 2))]
+            NDCT_patch = NDCT_slice[:, h_pc - hd: int(h_pc + np.round(h / 2)), \
+                                    w_pc - wd: int(w_pc + np.round(h / 2))]
         else: # 2d patch
-            LDCT_patch = LDCT_slice[h_pc - hd : int(h_pc + np.round(h/2)), w_pc - wd : int(w_pc + np.round(h/2))]
-            NDCT_patch = NDCT_slice[h_pc - hd : int(h_pc + np.round(h/2)), w_pc - wd : int(w_pc + np.round(h/2))]
+            LDCT_patch = LDCT_slice[h_pc - hd : int(h_pc + np.round(h/2)), \
+                                    w_pc - wd : int(w_pc + np.round(h/2))]
+            NDCT_patch = NDCT_slice[h_pc - hd : int(h_pc + np.round(h/2)), \
+                                    w_pc - wd : int(w_pc + np.round(h/2))]
 
         if self.augument:
-            return self.augumentation(LDCT_patch, NDCT_patch)
+            return augumentation(LDCT_patch, NDCT_patch)
         return LDCT_patch, NDCT_patch
 
-        
-    def preproc_input(self, args):
-        LDCT_imgs, NDCT_imgs = [],[]
-        for i in range(self.batch_size):
-            L_sltd_idx = np.random.choice(self.LDCT_index)
-            N_sltd_idx = np.random.choice(self.NDCT_index)
-            
-            if self.patch_size != self.image_size:
-                LDCT, NDCT = \
-                    self.get_randam_patches(self.LDCT_images[L_sltd_idx],\
-                                            self.NDCT_images[N_sltd_idx], args.patch_size)
-            else:
-                LDCT, NDCT = self.LDCT_images[L_sltd_idx],\
-                             self.NDCT_images[N_sltd_idx]
-            LDCT_imgs.append(np.expand_dims(LDCT, axis=-1))
-            NDCT_imgs.append(np.expand_dims(NDCT, axis=-1))
-        
-        return np.array(LDCT_imgs), np.array(NDCT_imgs)
-        
-        
-        
-                 
-#ROI crop
-def ROI_img(whole_image, row= [200, 350], col = [75, 225]):
-    patch_ = whole_image[row[0]:row[1], col[0] : col[1]]
-    return np.array(patch_)
 
 #psnr
 def log10(x):
@@ -209,37 +223,6 @@ def tf_psnr(img1, img2, PIXEL_MAX = 255.0):
     return 20 * log10(PIXEL_MAX / tf.sqrt(mse))
 
 
-def psnr(img1, img2, PIXEL_MAX = 255.0):
-    mse = np.mean((img1 - img2) ** 2 )
-    if mse == 0:
-        return 100
-    return 20 * math.log10(PIXEL_MAX / math.sqrt(mse))
-
-
-#save mk img
-def save_image(LDCT, NDCT, output_, save_dir = '.',  max_ = 1, min_= 0): 
-    f, axes  = plt.subplots(2, 3, figsize=(30, 20))
-    
-    axes[0,0].imshow(LDCT,  cmap=plt.cm.gray, vmax = max_, vmin = min_)
-    axes[0,1].imshow(NDCT,  cmap=plt.cm.gray, vmax = max_, vmin = min_)
-    axes[0,2].imshow(output_,  cmap=plt.cm.gray, vmax = max_, vmin = min_)
-    
-    axes[1,0].imshow(NDCT.astype(np.float32) - LDCT.astype(np.float32),  cmap=plt.cm.gray, vmax = max_, vmin = min_)
-    axes[1,1].imshow(NDCT - output_,  cmap=plt.cm.gray, vmax = max_, vmin = min_)
-    axes[1,2].imshow(output_ - LDCT,  cmap=plt.cm.gray, vmax = max_, vmin = min_)
-    
-    axes[0,0].title.set_text('LDCT image')
-    axes[0,1].title.set_text('NDCT image')
-    axes[0,2].title.set_text('output image')
-    
-    axes[1,0].title.set_text('NDCT - LDCT  image')
-    axes[1,1].title.set_text('NDCT - outupt image')
-    axes[1,2].title.set_text('output - LDCT  image')
-    if save_dir != '.':
-        f.savefig(save_dir)
-        plt.close()   
-
-        
 #---------------------------------------------------
 # argparser string -> boolean type
 def ParseBoolean (b):
@@ -254,3 +237,4 @@ def ParseBoolean (b):
 # argparser string -> boolean type
 def ParseList(l):
     return l.split(',')
+       

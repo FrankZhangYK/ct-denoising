@@ -10,35 +10,18 @@
 * CYCLEGAN
 >	* paper : https://arxiv.org/abs/1703.10593
 >	* original code: https://github.com/xhujoy/CycleGAN-tensorflow
-## I/O (DICOM file -> .npy)
-* Input data Directory  
-  * DICOM file extension = [<b>'.IMA'</b>, '.dcm']
-> $ os.path.join(dcm_path, patent_no, [LDCT_path|NDCT_path], '*.' + extension)
 
-The dcm_path directory should look like:
+## Run command example
+$ touch run_cycleident.sh
+$ vi run_cycleident
+> nohup python main.py --end_epoch=10 --decay_epoch=5 --result=/data/hyeongyu/CYCLE_IDENT --phase=train > cycle_ident_train_log --gpu_no=0 &&
+> nohup python main.py --result=/data/hyeongyu/CYCLE_IDENT --phase=test > cycle_ident_test_log --gpu_no=0 &
 
-    dcm_path
-    ├── L067
-    │   ├── quarter_3mm
-    │   │       ├── L067_QD_3_1.CT.0004.0001 ~ .IMA
-    │   │       ├── L067_QD_3_1.CT.0004.0002 ~ .IMA
-    │   │       └── ...
-    │   └── full_3mm
-    │           ├── L067_FD_3_1.CT.0004.0001 ~ .IMA
-    │           ├── L067_FD_3_1.CT.0004.0002 ~ .IMA
-    │           └── ...
-    ├── L096
-    │   ├── quarter_3mm
-    │   │       └── ...
-    │   └── full_3mm
-    │           └── ...      
-    ...
-    │
-    └── L506
-        ├── quarter_3mm
-        │       └── ...
-        └── full_3mm
-                └── ...     
+## Output
+1. tensorboard
+2. input params
+3. model
+4. generated img(.npy)
 
 ## [Common] Main file(main.py) Parameters
 * Directory
